@@ -61,11 +61,25 @@ export GRIDSTATUS_API_KEY=...     # only for the ERCOT/stack downloads;
    `download_caiso_bids.py` / `caiso_dam_counterfactual.py` (CAISO OASIS bids),
    and `stack_counterfactual.py` (Fig 1 inputs).
 2. Build the per-hour cache: `python annual_savings.py` (its `compute()` writes
-   `data/annual/<market>/*.parquet`).
+   `data/annual/v<N>/<market>/*.parquet`, where `<N>` is `CACHE_VERSION`; pass
+   `--force` to rebuild).
 3. Generate the figures: `python Fig1.py` … `python Fig6.py`.
 
 The GridStatus key is read only from the `GRIDSTATUS_API_KEY` environment
 variable — it never appears in the code or in any committed file.
+
+## Tests
+
+Two standalone modules cover the numerics that feed the reported figures and
+tables — the production-cost stack integral, the price/anchor lookups, and the
+step-plot coordinates:
+
+```
+python tests/test_integral.py       # stack integral (segment traversal, caps)
+python tests/test_stack_lookup.py   # price_np, anchor edges, step_xy
+```
+
+Each runs standalone as shown, or under `pytest` if it is installed.
 
 ## Notes
 
@@ -94,9 +108,13 @@ variable — it never appears in the code or in any committed file.
 
 ## Verification
 
-All six generated figures were regenerated from this folder after it was moved
-out of `bidstack/` to the repo root (2026-07-20) and each is byte-identical
-(MD5) to the image embedded in **V4** — confirming the relocated code and the
-consolidated `../data/` paths reproduce the paper exactly. Fig. 7 is a manual
-export, so `fig7_schematic.png` here is the exact PNG lifted from the V4
+The generated figures are built from this folder (the code was first relocated
+out of `bidstack/` to the repo root on 2026-07-20, where each figure then
+reproduced its V4 embed byte-for-byte). Figs 1–5 follow the same analysis as
+**V4**; Fig. 6's supply stacks were subsequently corrected to draw
+left-continuous steps (`where="pre"`), so `fig6_stacks.jpg` here supersedes the
+image embedded in V4. The production-cost integral fix in `annual_savings.py`
+changes the reported production-cost numbers (ERCOT $92M/$281M, CAISO
+$486M/$651M for 2024/2025) but not the consumer-savings figures. Fig. 7 is a
+manual export, so `fig7_schematic.png` here is the exact PNG lifted from the V4
 package.

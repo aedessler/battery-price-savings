@@ -68,7 +68,8 @@ def main():
     fig, ax = plt.subplots(figsize=(13, 7))
     qs, ls, ts = [], [], []
     for date, p, cum, lam, q0 in curves:
-        ax.step(cum / 1000, p, where="post",
+        sx, sy = A.step_xy(cum / 1000, p)
+        ax.step(sx, sy, where="pre",
                 color=cmap(norm(date.toordinal())), lw=0.8, alpha=0.45)
         qs.append(q0 / 1000)
         ls.append(lam)

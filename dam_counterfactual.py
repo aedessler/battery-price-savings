@@ -250,7 +250,7 @@ def plot_curve_snapshot(gen, eo, res, day, hour_ct, out_path):
     fig, ax = plt.subplots(figsize=(12, 7))
     ax.step(np.concatenate([[0], stack["cum_mw"] / 1000]),
             np.concatenate([[stack["price"].iloc[0]], stack["price"]]),
-            where="post", color="#333", lw=1.2)
+            where="pre", color="#333", lw=1.2)
     ax.axhline(row["dam_lambda"], color="#0072B2", lw=1, ls="--", alpha=0.7)
     ax.plot(q_a, row["dam_lambda"], "o", color="#0072B2", ms=9, zorder=5,
             label=f"With batteries (observed λ) = ${row['dam_lambda']:.0f}")
@@ -411,7 +411,7 @@ def plot_month():
         color = cmap(norm(day))
         ax.step(np.concatenate([[0], stack["cum_mw"] / 1000]),
                 np.concatenate([[stack["price"].iloc[0]], stack["price"]]),
-                where="post", color=color, lw=1.0, alpha=0.7)
+                where="pre", color=color, lw=1.0, alpha=0.7)
         L = lam[lam["interval_start_utc"] == ts]["system_lambda"]
         if not L.empty:
             q = anchor_quantity(stack, float(L.iloc[0])) / 1000
@@ -504,9 +504,9 @@ def overlay_8pm(all_days=False, add_base=True):
                     base_mw = max(load - q_star, 0.0)
                     bases.append(base_mw / 1000)
 
-                x = (stack["cum_mw"] + base_mw) / 1000
-                ax.step(x, stack["price"], where="post",
-                        color=color, lw=0.8, alpha=0.5)
+                x = np.concatenate([[base_mw], stack["cum_mw"] + base_mw]) / 1000
+                ax.step(x, np.concatenate([stack["price"].iloc[:1], stack["price"]]),
+                        where="pre", color=color, lw=0.8, alpha=0.5)
                 n += 1
 
     if add_base and bases:

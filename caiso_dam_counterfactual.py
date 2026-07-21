@@ -235,7 +235,9 @@ def run_day(date):
     stack, lam, ps = stacks[hr], obs.loc[hr, "dam_price"], obs.loc[hr, "power_storage"]
     q, p_wo, dp = counterfactual(stack, lam, ps)
     fig, ax = plt.subplots(figsize=(12, 7))
-    ax.step(stack["cum_mw"] / 1000, stack["price"], where="post", color="#333", lw=1.5)
+    ax.step(np.concatenate([[0.0], stack["cum_mw"] / 1000]),
+            np.concatenate([stack["price"].iloc[:1], stack["price"]]),
+            where="pre", color="#333", lw=1.5)
     ax.axhline(lam, color="#0072B2", ls="--", lw=1.2,
                label=f"observed DAM price ${lam:.0f}")
     ax.axvline(q / 1000, color="#0072B2", ls=":", lw=1.2,
@@ -534,8 +536,9 @@ def overlay_8pm():
                 continue
             st = stacks[20]
             c = "#9ecae1" if y == 2024 else "#08519c"
-            ax.step(st["cum_mw"] / 1000, st["price"], where="post",
-                    color=c, lw=0.8, alpha=0.5)
+            ax.step(np.concatenate([[0.0], st["cum_mw"] / 1000]),
+                    np.concatenate([st["price"].iloc[:1], st["price"]]),
+                    where="pre", color=c, lw=0.8, alpha=0.5)
     ax.plot([], [], color="#9ecae1", lw=2, label="2024 (4 days/month)")
     ax.plot([], [], color="#08519c", lw=2, label="2025 (4 days/month)")
     ax.set_xlabel("Cumulative supply (GW)")

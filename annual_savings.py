@@ -9,10 +9,10 @@ any scarcity-price treatment afterward without rebuilding stacks:
     and on the battery-offer-removed stack (primary variant; batteries don't
     exist in the no-battery world, so their offers shouldn't either);
   - stack totals + exhaustion flags (did q* + power_storage run off the top?);
-  - the production-cost integral along the battery-free stack between the two
-    operating points, computed raw and at a grid of price caps (the integral is
-    piecewise-linear in the cap, so any hour-specific cap — e.g. the empirical
-    scarcity price — can be recovered by interpolation).
+  - the production-cost integrand along the battery-free stack between the two
+    operating points, cached as the exact traversed (price, dq) segments so any
+    hour-specific cap — e.g. the empirical scarcity price — is priced later,
+    exactly, without rebuilding the stack.
 
 Treatments applied in `aggregate` (post-processing, seconds):
   floor    counterfactual price capped at the max observed DAM price in that
@@ -41,10 +41,16 @@ import pandas as pd
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 FIG_DIR = os.path.join(HERE, "figs")
-ANNUAL_DIR = os.path.join(REPO, "data", "annual")
+
+# Bump when the per-day cache schema or the numerical method changes. Caches are
+# written under data/annual/v{CACHE_VERSION}/ and every file also carries a
+# `cache_version` column, so a bump forces a clean rebuild instead of silently
+# reusing stale results (see compute()); older versions stay on disk untouched
+# for before/after comparison.
+CACHE_VERSION = 2
+ANNUAL_DIR = os.path.join(REPO, "data", "annual", f"v{CACHE_VERSION}")
 
 YEARS = [2024, 2025]
-CAP_GRID = [100, 150, 200, 300, 500, 750, 1000, 1500, 2000, 3000, 5000]
 ADMIN_CAP = {"ercot": 5000.0, "caiso": 1000.0}
 
 
@@ -58,10 +64,19 @@ def _arrays(stack):
     return p, mw, cum
 
 
-def anchor_np(p, cum, lam):
+def anchor_np(p, cum, lam, edge="right"):
+    """Cumulative quantity where the stack first reaches the observed price `lam`.
+
+    edge="right" returns the right edge of the first block priced >= lam (cum[i]);
+    edge="left" returns that block's left edge (cum[i-1], or 0 for the first
+    block). The two bracket the flat marginal block; the choice is a methodology
+    decision (see the aggregate() left-vs-right anchoring sensitivity report).
+    """
     i = np.searchsorted(p, lam, side="left")
     if i >= len(p):
         return float(cum[-1])
+    if edge == "left":
+        return float(cum[i - 1]) if i > 0 else 0.0
     return float(cum[i])
 
 
@@ -72,27 +87,63 @@ def price_np(p, cum, q, fill):
     return float(p[i])
 
 
-def integral_np(p, mw, cum, q1, q2, cap, fill):
-    """Signed integral of min(price, cap) dq from q1 to q2; quantities beyond
-    the stack top use `fill` as the price."""
+def step_xy(cum, price):
+    """Staircase plot coordinates matching the price_np lookup convention:
+    price[i] occupies the quantity interval (cum[i-1], cum[i]], with the first
+    block running from 0. Use as ax.step(*step_xy(cum, price), where="pre") or
+    ax.plot(*step_xy(cum, price)). Callers add any base offset to the x array."""
+    cum = np.asarray(cum, dtype=float)
+    price = np.asarray(price, dtype=float)
+    x = np.concatenate([[0.0], cum])
+    y = np.concatenate([price[:1], price])
+    return x, y
+
+
+def traversed_np(p, mw, cum, q1, q2, fill):
+    """Segments the signed sweep q1 -> q2 spans on the stack.
+
+    Returns (seg_price, seg_dq), where seg_dq carries the sweep sign and any
+    quantity beyond the top of the stack is priced at `fill`. For any cap,
+        sum(minimum(seg_price, cap) * seg_dq)
+    is the signed integral of min(price, cap) dq from q1 to q2. This is the exact
+    replacement for the old fixed cap grid: it counts the top partial segment
+    (which the searchsorted-slice integral dropped) and prices any cap directly,
+    including caps below the former $100 grid floor.
+    """
     if q1 == q2:
-        return 0.0
+        return np.empty(0), np.empty(0)
     sign = 1.0 if q2 > q1 else -1.0
     lo, hi = (q1, q2) if q2 > q1 else (q2, q1)
     lo = max(lo, 0.0)
     left = cum - mw
-    i0 = np.searchsorted(cum, lo, side="left")
-    i1 = np.searchsorted(cum, hi, side="right")
-    total = 0.0
-    if i1 > i0:
-        ps = np.minimum(p[i0:i1], cap) if cap is not None else p[i0:i1]
-        ov = (np.minimum(cum[i0:i1], hi) - np.maximum(left[i0:i1], lo)).clip(min=0)
-        total = float(ps @ ov)
-    top = cum[-1]
-    if hi > top:                              # beyond the offered supply
-        f = min(fill, cap) if cap is not None else fill
-        total += f * (hi - max(lo, top))
-    return sign * total
+    top = float(cum[-1])
+    prices, dqs = [], []
+    hi_in = min(hi, top)
+    if hi_in > lo:
+        i0 = np.searchsorted(cum, lo, side="left")
+        i1 = np.searchsorted(cum, hi_in, side="left")   # segment containing hi_in
+        sl = slice(i0, i1 + 1)
+        ov = (np.minimum(cum[sl], hi_in) - np.maximum(left[sl], lo)).clip(min=0.0)
+        keep = ov > 0
+        prices.append(p[sl][keep])
+        dqs.append(ov[keep])
+    if hi > top:                                        # beyond the offered supply
+        prices.append(np.array([float(fill)]))
+        dqs.append(np.array([hi - max(lo, top)]))
+    if not prices:
+        return np.empty(0), np.empty(0)
+    return np.concatenate(prices), np.concatenate(dqs) * sign
+
+
+def integral_np(p, mw, cum, q1, q2, cap, fill):
+    """Signed integral of min(price, cap) dq from q1 to q2 (cap=None -> uncapped);
+    thin wrapper over traversed_np so both share the corrected segment logic."""
+    pr, dq = traversed_np(p, mw, cum, q1, q2, fill)
+    if pr.size == 0:
+        return 0.0
+    if cap is not None:
+        pr = np.minimum(pr, cap)
+    return float(pr @ dq)
 
 
 # ── per-day computation ─────────────────────────────────────────────────────────
@@ -100,19 +151,30 @@ def integral_np(p, mw, cum, q1, q2, cap, fill):
 def _hour_record(stacks_full, stacks_nb, hour, lam, ps, load, nl, market):
     fill = ADMIN_CAP[market]
     rec = dict(hour=hour, lam=lam, ps=ps, load=load, net_load=nl)
-    for tag, st in [("full", stacks_full), ("nb", stacks_nb)]:
-        p, mw, cum = _arrays(st)
-        q = anchor_np(p, cum, lam)
-        rec[f"q_{tag}"] = q
-        rec[f"tot_{tag}"] = float(cum[-1])
-        rec[f"p_{tag}"] = min(price_np(p, cum, q + ps, fill), fill)
-        rec[f"exh_{tag}"] = bool(q + ps > cum[-1])
-    # production-cost integrals on the battery-free stack
+
+    # full (paper-parallel) stack — right-edge anchor only
+    p, mw, cum = _arrays(stacks_full)
+    q = anchor_np(p, cum, lam)
+    rec["q_full"] = q
+    rec["tot_full"] = float(cum[-1])
+    rec["p_full"] = min(price_np(p, cum, q + ps, fill), fill)
+    rec["exh_full"] = bool(q + ps > cum[-1])
+
+    # battery-free stack — the primary variant. Compute under both anchor
+    # conventions (right = headline, left = sensitivity) and cache the exact
+    # traversed (price, dq) segments in place of the old int_c{cap} grid, so any
+    # hour-specific cap is priced later without rebuilding the stack.
     p, mw, cum = _arrays(stacks_nb)
-    q = rec["q_nb"]
-    rec["int_raw"] = integral_np(p, mw, cum, q, q + ps, None, fill)
-    for c in CAP_GRID:
-        rec[f"int_c{c}"] = integral_np(p, mw, cum, q, q + ps, float(c), fill)
+    rec["tot_nb"] = float(cum[-1])
+    for edge, suf in [("right", ""), ("left", "_left")]:
+        q = anchor_np(p, cum, lam, edge=edge)
+        seg_p, seg_dq = traversed_np(p, mw, cum, q, q + ps, fill)
+        rec[f"q_nb{suf}"] = q
+        rec[f"p_nb{suf}"] = min(price_np(p, cum, q + ps, fill), fill)
+        rec[f"exh_nb{suf}"] = bool(q + ps > cum[-1])
+        rec[f"seg_price{suf}"] = seg_p
+        rec[f"seg_dq{suf}"] = seg_dq
+        rec[f"int_raw{suf}"] = float(seg_p @ seg_dq) if seg_p.size else 0.0
     return rec
 
 
@@ -194,7 +256,17 @@ def _day_ercot(date, day_csv):
     return rows
 
 
-def compute(market, shard=0, nshards=1):
+def _cache_ok(path):
+    """A cached day is reusable only if it is readable, non-empty, and stamped
+    with the current CACHE_VERSION."""
+    try:
+        meta = pd.read_parquet(path, columns=["cache_version"])
+    except Exception:
+        return False
+    return len(meta) > 0 and int(meta["cache_version"].iloc[0]) == CACHE_VERSION
+
+
+def compute(market, shard=0, nshards=1, force=False, force_date=None):
     if market == "caiso":
         from caiso_dam_counterfactual import load_paper_csv
         csv = load_paper_csv()
@@ -213,12 +285,15 @@ def compute(market, shard=0, nshards=1):
             dates.append(d)
             d += dt.timedelta(days=1)
     dates = [d for i, d in enumerate(dates) if i % nshards == shard]
-    done = skipped = 0
+    done = skipped = stale = 0
     for i, date in enumerate(dates):
         path = os.path.join(out_dir, f"{date:%Y%m%d}.parquet")
-        if os.path.exists(path):
-            skipped += 1
-            continue
+        do_force = force or (force_date is not None and date == force_date)
+        if os.path.exists(path) and not do_force:
+            if _cache_ok(path):
+                skipped += 1
+                continue
+            stale += 1        # exists but wrong version / unreadable -> rebuild
         day_csv = csv[csv["date"] == date].set_index("hour")
         # DST fall-back days repeat a local hour; keep the first occurrence
         day_csv = day_csv[~day_csv.index.duplicated(keep="first")]
@@ -233,12 +308,16 @@ def compute(market, shard=0, nshards=1):
             continue
         df = pd.DataFrame(rows)
         df.insert(0, "date", pd.Timestamp(date))
-        df.to_parquet(path)
+        df["cache_version"] = CACHE_VERSION
+        tmp = f"{path}.tmp"
+        df.to_parquet(tmp)
+        os.replace(tmp, path)        # atomic: never leave a partial cache behind
         done += 1
         if done % 25 == 0:
             print(f"[{i+1}/{len(dates)}] {date} done={done} skipped={skipped}",
                   flush=True)
-    print(f"{market}: computed {done} days, {skipped} already cached")
+    print(f"{market}: wrote {done} days ({stale} rebuilt stale), "
+          f"{skipped} reused (cache v{CACHE_VERSION} at {out_dir})")
 
 
 # ── aggregation ─────────────────────────────────────────────────────────────────
@@ -252,15 +331,6 @@ def _load_hourly(market):
     df["year"] = df["date"].dt.year
     df["month"] = df["date"].dt.month
     return df
-
-
-def _interp_integral(row, cap):
-    """Integral with hour-specific cap, interpolated on the CAP_GRID columns."""
-    caps = np.array(CAP_GRID, dtype=float)
-    vals = np.array([row[f"int_c{c}"] for c in CAP_GRID])
-    if cap >= caps[-1]:
-        return row["int_raw"]
-    return float(np.interp(cap, caps, vals))
 
 
 def apply_treatments(df, market, variant="nb"):
@@ -298,23 +368,36 @@ def apply_treatments(df, market, variant="nb"):
     for t in ["floor", "central", "ceiling"]:
         df[f"cons_{t}"] = (df[f"p_{t}"] - df["lam"]) * df["load"]
 
-    # production-cost savings: cap the integrand the same way
-    caps = np.array(CAP_GRID, dtype=float)
-    ints = df[[f"int_c{c}" for c in CAP_GRID]].to_numpy()
-    raw = df["int_raw"].to_numpy()
-
-    def integral_at(cap_arr):
+    # production-cost savings: exact capped integral from the cached traversed
+    # segments, prod_t = sum(min(seg_price, cap_t) * seg_dq) per hour. This prices
+    # sub-$100 caps correctly (the old CAP_GRID/np.interp path clamped every cap
+    # below $100 up to the $100 integral).
+    def prod_at(cap_arr, price_col="seg_price", dq_col="seg_dq"):
         cap_arr = np.asarray(cap_arr, dtype=float)
+        scalar = cap_arr.ndim == 0
+        sp = df[price_col].to_numpy()
+        sd = df[dq_col].to_numpy()
         out = np.empty(len(df))
         for i in range(len(df)):
-            c = cap_arr[i] if cap_arr.ndim else float(cap_arr)
-            out[i] = raw[i] if c >= caps[-1] else np.interp(c, caps, ints[i])
+            pr = np.asarray(sp[i], dtype=float)
+            if pr.size == 0:
+                out[i] = 0.0
+                continue
+            c = float(cap_arr) if scalar else cap_arr[i]
+            out[i] = float(np.minimum(pr, c) @ np.asarray(sd[i], dtype=float))
         return out
 
-    df["prod_floor"] = integral_at(monthmax.to_numpy())
-    df["prod_central"] = integral_at(cap_central)
-    df["prod_ceiling"] = raw if cap_ceiling >= caps[-1] else integral_at(
-        np.full(len(df), cap_ceiling))
+    df["prod_floor"] = prod_at(monthmax.to_numpy())
+    df["prod_central"] = prod_at(cap_central)
+    df["prod_ceiling"] = prod_at(np.full(len(df), cap_ceiling))
+
+    # anchoring sensitivity: the central treatment under the left-edge anchor,
+    # when those columns were cached (see aggregate()'s comparison table).
+    if "p_nb_left" in df and "seg_price_left" in df:
+        df["cons_central_left"] = (np.minimum(df["p_nb_left"], cap_central)
+                                   - df["lam"]) * df["load"]
+        df["prod_central_left"] = prod_at(cap_central, "seg_price_left",
+                                          "seg_dq_left")
     return df
 
 
@@ -483,6 +566,33 @@ def aggregate():
     print(dg.to_string(index=False, float_format=lambda v: f"{v:8.2f}"))
     dg.to_csv(os.path.join(FIG_DIR, "scarcity_diagnostics.csv"), index=False)
 
+    # ── anchoring sensitivity: left- vs right-edge marginal-block anchor ──────
+    # How much the central estimate moves if the operating point is anchored at
+    # the left edge of the marginal offer block instead of the right (current)
+    # edge. Consumer side gauges movement in the headline (Table 1) numbers.
+    anch = []
+    for market in ["ercot", "caiso"]:
+        df = monthly_frames[market]
+        if "cons_central_left" not in df:
+            continue
+        for y in YEARS:
+            sub = df[df["year"] == y]
+            anch.append(dict(
+                market=market, year=y,
+                cons_right=sub["cons_central"].sum() / 1e6,
+                cons_left=sub["cons_central_left"].sum() / 1e6,
+                prod_right=sub["prod_central"].sum() / 1e6,
+                prod_left=sub["prod_central_left"].sum() / 1e6))
+    if anch:
+        ad = pd.DataFrame(anch)
+        ad["cons_delta"] = ad["cons_left"] - ad["cons_right"]
+        ad["prod_delta"] = ad["prod_left"] - ad["prod_right"]
+        print("\nanchoring sensitivity — central estimate, $M "
+              "(delta = left-edge minus right-edge anchor):")
+        print(ad.to_string(index=False, float_format=lambda v: f"{v:9.1f}"))
+        ad.to_csv(os.path.join(FIG_DIR, "anchor_sensitivity.csv"), index=False)
+        print(f"saved {os.path.join(FIG_DIR, 'anchor_sensitivity.csv')}")
+
     # ── headline range figure ────────────────────────────────────────────────
     fig, axes = plt.subplots(1, 2, figsize=(13, 6))
     for ax, metric, label in [(axes[0], "cons", "Consumer savings"),
@@ -572,9 +682,17 @@ def aggregate():
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "aggregate"
     if cmd == "compute":
-        shard = int(sys.argv[3]) if len(sys.argv) > 3 else 0
-        nshards = int(sys.argv[4]) if len(sys.argv) > 4 else 1
-        compute(sys.argv[2], shard, nshards)
+        rest = sys.argv[2:]
+        force = "--force" in rest
+        force_date = None
+        for a in rest:
+            if a.startswith("--force-date="):
+                force_date = dt.date.fromisoformat(a.split("=", 1)[1])
+        pos = [a for a in rest if not a.startswith("--")]
+        market = pos[0]
+        shard = int(pos[1]) if len(pos) > 1 else 0
+        nshards = int(pos[2]) if len(pos) > 2 else 1
+        compute(market, shard, nshards, force=force, force_date=force_date)
     elif cmd == "aggregate":
         aggregate()
     elif cmd == "drop-exhausted":
