@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+
+# OS / editor
+.DS_Store
+
+# Keynote source of the hand-drawn schematic (only the .png export is tracked)
+*.key
+
+# Regenerable outputs and superseded working files
+figs/
+archive/
+validation_points.csv
+
+# Re-downloadable working data (fetched by the download/process scripts).
+# The two complete_*.csv masters under data/ercot and data/caiso stay tracked.
+data/dam/
+data/annual/
+data/as/
+data/stack_counterfactual/
+data/caiso/pub_bids/
+data/caiso/storage_awards.parquet
+data/caiso/storage_bids.parquet
